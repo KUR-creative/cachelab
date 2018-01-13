@@ -1,0 +1,1167 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <getopt.h>
+#include <stdbool.h>
+#include "cachelab.h"
+
+//#define	SUCCESS		0
+//#define	MALLOC_ERR	1
+
+struct Node;
+
+typedef enum SIM_ACT { 
+	HIT, 
+	MISS, 
+	EVICT,
+	ACT_NUM,	// number of simulation act
+} SIM_ACT;
+
+
+typedef struct {
+	char			act;
+	unsigned long	addr;
+	int				size;
+} Trace;
+
+typedef struct {
+	int				s;	// number of sets in cache.
+	int				E;	// number of lines in one set.
+	int				b;	// number of block bits.
+} Tuple_sEb;
+
+
+typedef struct Line {
+	bool			isValid;
+	unsigned int	tag;
+} Line;
+
+typedef struct Set {
+	struct Node*	queue;
+	Line*			lineArr;
+} Set;
+
+typedef struct Cache {
+	Set*			setArr;
+	int				S;	// number of sets.
+	int				E;	// number of lines.
+} Cache;
+
+typedef struct Node {
+	union 
+	{
+		SIM_ACT		act;
+		Line*		ptr;
+	};
+	struct Node*	next;
+} Node;
+
+/****************************************************
+ *		linked list functions
+ ****************************************************/
+//if malloc error occurred, then return NULL
+Node*		createLinkedList(SIM_ACT firstValue)
+{
+	Node*	ret = malloc( sizeof(Node) );
+	ret->act = firstValue;
+	ret->next = NULL; 
+	return ret;
+}
+
+// return tail node ptr of list
+Node*		addNode(Node* tail, SIM_ACT nodeValue)
+{
+	Node*	tmp = malloc( sizeof(Node) );
+	if(tmp == NULL){
+		printf("heap allocation error occurred! \n");
+		exit(EXIT_FAILURE);
+	}
+	tmp->act = nodeValue; 
+	tmp->next = tail->next;
+	tail->next = tmp;
+	return tmp;
+}
+
+// if list were not allocated, then return NULL
+Node*		getTail(Node* listHead)
+{
+	Node*	cursor	= listHead;
+	if(cursor == NULL){
+		return NULL;
+	}
+	while(cursor->next != NULL){
+		cursor = cursor->next;		
+		//printf(">!> %p << \n", cursor->next);		
+	}			//printf(">>> %p << \n", cursor);		
+	return cursor;
+}
+
+int			getLength(Node* listHead)
+{
+	Node*	cursor	= listHead;
+	int		len		= 0;
+	while(cursor != NULL){
+		len++;
+		cursor = cursor->next;
+	}
+	return len;
+}
+
+void		printList(Node* listHead)
+{
+	if(listHead == NULL){
+		puts("empty list!");
+	}
+
+	Node*	cursor	= listHead;
+	while(cursor != NULL){
+		switch(cursor->act){
+		case HIT:
+			printf("hit ");
+			break;
+		case MISS:
+			printf("miss ");
+			break;
+		case EVICT:
+			printf("eviction ");
+			break;
+		default:
+			printf("WTF ");
+		}
+		cursor = cursor->next;
+	}
+	putchar('\n');
+}
+
+// free all of Nodes in list
+// and head = NULL;
+void		freeList(Node** listHead)
+{
+	Node*	cursor = *listHead;
+	while(cursor != NULL){
+		Node* next = cursor->next;
+		free(cursor);
+		cursor = next;
+	}
+
+	*listHead = NULL;
+}
+
+
+/****************************************************
+ *		queue functions
+ *EMPTY QUEUE means:	Node* queue = NULL; 
+ ****************************************************/
+
+// it return pointer that refer to tail node of queue
+Node*		enqueue(Node** queue, Line* line)
+{
+	Node*	tail		= getTail(*queue);
+	SIM_ACT	converted	= (SIM_ACT)line; 
+	if(tail == NULL){ // queue is empty!
+		*queue = createLinkedList( converted );
+				//DBG: printf("len? = %d \n", getLength(*queue));
+		return *queue;
+	}
+	tail = addNode(*queue, converted);
+	return tail;
+}
+
+Line*		peek(Node* queue)
+{
+	return queue->ptr; 
+}
+
+// avoid this. instead, use dequeueAndFree.
+// you NEED to FREE returned Node YOURSELF..!
+Node*		dequeue(Node** queue)
+{	
+	Node*	head	= *queue;
+	*queue = head->next;
+	return head;
+}
+
+Line*		dequeueAndFree(Node** queue)
+{
+	Node*	head		= *queue;
+	Line*	retCachePtr	= head->ptr;
+	*queue = head->next;
+	free(head);
+	return retCachePtr;
+}
+
+
+/****************************************************
+ *		trace file to Trace array functions
+ ****************************************************/
+int			getNumOfValidLines(FILE* pFile)
+{
+	int len = 0;
+	int c;
+
+	while((c = fgetc(pFile)) != EOF){
+		if(c == 'L' || c == 'S' || c == 'M'){
+			len++;
+		}
+	}
+	rewind(pFile);
+
+	return len;
+}
+
+void		traceFileToTraceArr(FILE* traceFile, Trace traceArr[])
+{
+	int	i = 0;
+	char act; void** addr; int size;
+	while(fscanf(traceFile, " %c %p,%d", &act, &addr, &size) != EOF)
+	{
+		if(act != 'I'){
+			traceArr[i].act  = act;
+			traceArr[i].addr = (unsigned long)addr;
+			traceArr[i].size = size;
+			i++;
+		}
+	}
+}
+
+
+/****************************************************
+ *		Trace address split functions
+ * Trace.addr -> [tag, set_index, block_offset]
+ * s,b are number of bits
+ ****************************************************/
+unsigned	getOffset(unsigned long address, size_t b)
+{
+	size_t shiftVal		= 8 * sizeof(unsigned long) - b;
+	address <<= shiftVal;
+	address >>= shiftVal;
+	return address;
+}
+unsigned	getSetIndex(unsigned long address, size_t s, size_t b)
+{
+	size_t shiftUpVal	= 8 * sizeof(unsigned long) - (s + b);
+	size_t shiftDownVal	= 8 * sizeof(unsigned long) - s;
+	address <<= shiftUpVal;
+	address >>= shiftDownVal;
+	return address;
+}
+unsigned	getTag(unsigned long address, size_t s, size_t b)
+{
+	size_t shiftVal		= s + b;
+	address >>= shiftVal;
+	return address;
+}
+
+/****************************************************
+ *		other interfacing functions
+ ****************************************************/
+//ex) int h,v; char* path = "blabla.."
+//interpretOptions(argc, argv, &path, h, v);
+Tuple_sEb	interpretOptions(int argc, char* argv[],	
+							char** traceFilePath,	
+							int* helpFlag, 
+							int* verboseFlag)
+{
+	Tuple_sEb	ret;
+
+	*helpFlag = 0;
+	*verboseFlag = 0;
+
+	int opt;
+	while((opt = getopt(argc, argv, "sEbt:vh::")) != -1){
+		switch(opt){
+		case 's':
+			ret.s = atoi(argv[optind]);
+			break;
+		case 'E':
+			ret.E = atoi(argv[optind]);
+			break;
+		case 'b':
+			ret.b = atoi(argv[optind]);
+			break;
+		case 't':
+			//printf(">> %s \n", optarg);
+			//printf(">> %s \n", argv[optind]);
+			//*traceFilePath = argv[optind];
+			*traceFilePath = optarg;
+			break;
+		case 'v':
+			//printf(" v ");
+			*verboseFlag = 1;
+			break;
+		case 'h':
+			*helpFlag = 1;
+		default:
+			ret.s = 0;
+			ret.E = 0;
+			ret.b = 0;
+
+			*helpFlag = 0;
+			*verboseFlag = 0;
+			*traceFilePath = NULL;
+			return ret;
+		}
+	}
+
+	return ret;
+}
+
+/*
+			printf("Usage: ./csim-ref [-hv] -s <num> -E <num> -b <num> -t <file>\n");
+			printf("Options:\n");
+			printf("-h         Print this help message.\n");
+			printf("-v         Optional verbose flag.\n");
+			printf("-s <num>   Number of set index bits.\n");
+			printf("-E <num>   Number of lines per set.\n");
+			printf("-b <num>   Number of block offset bits.\n");
+			printf("-t <file>  Trace file.\n");
+			printf("\n");
+			printf("Examples:\n");
+			printf("linux>  ./csim-ref -s 4 -E 1 -b 4 -t traces/yi.trace\n");
+			printf("linux>  ./csim-ref -v -s 8 -E 2 -b 4 -t traces/yi.trace\n");
+			*/
+
+void		getSummary(SIM_ACT summary[ACT_NUM], 
+						Node* resultListArr[],
+						int resArrLen)
+{
+	summary[MISS]	= 0;
+	summary[HIT] 	= 0;
+	summary[EVICT]	= 0;	
+	for(int i = 0; i < resArrLen; i++){
+		Node* cursor = resultListArr[i];
+		while(cursor != NULL){
+			switch(cursor->act){
+			case HIT:
+				summary[HIT]++;
+				break;
+			case MISS:
+				summary[MISS]++;
+				break;
+			case EVICT:
+				summary[EVICT]++;
+				break;
+			default:
+				printf("wtf in summary");
+			}
+			cursor = cursor->next;
+		}
+	}
+}
+
+FILE*		traceFileOpen(char* path)
+{
+	FILE*	retFile	= fopen(path, "r");
+	if(retFile == NULL) {
+		perror("File opening failed!");
+		exit(EXIT_FAILURE);
+	}
+	return retFile;
+}
+
+/****************************************************
+ *		Cache functions
+ ****************************************************/
+Cache*		createCache(Tuple_sEb sEb)
+{
+	// init Cache 
+	Cache*	cache	= malloc( sizeof(Cache) );
+	cache->S = (1 << sEb.s);	// S = 2^s
+	cache->E = sEb.E;
+	cache->setArr = malloc( cache->S * sizeof(Set) );
+
+	// init Set(s) 
+	for(int i = 0; i < cache->S; i++){
+		cache->setArr[i].queue = NULL;	// init Empty queue(s)
+		cache->setArr[i].lineArr 
+			= malloc( cache->E * sizeof(Line) );
+		// init Line(s)
+		for(int j = 0; j < sEb.E; j++){
+			cache->setArr[i].lineArr[j].isValid = false;
+			cache->setArr[i].lineArr[j].tag = 0U;
+		}
+	}
+
+	return cache;
+}
+		
+Node*		runCache(Cache* cache, Trace trace, Tuple_sEb sEb)
+{
+	size_t			s			= (size_t)sEb.s;
+	size_t			E			= (size_t)sEb.E;
+	size_t			b			= (size_t)sEb.b;
+
+	char			act			= trace.act;
+	unsigned long	addr		= trace.addr;
+
+	unsigned		S			= cache->S;
+
+	Node*			retListHead	= NULL;
+	Node*			retListTail	= NULL;
+
+	// select a Set in Cache.
+	unsigned		idx			= getSetIndex(addr,s,b) % S;
+	Set*			set			= cache->setArr + idx;
+		
+	int				validLineNum= 0;
+
+	// select a Line in Set: 
+	Line*			line		= NULL;
+	unsigned		lineTag		= 0;
+	//TODO: need to move ^ this variables later...
+	unsigned		traceTag	= getTag(addr,s,b);
+
+	// tag matching
+	for(int i = 0; i < E; i++){
+		bool		isLineValid	= false;
+		line		= set->lineArr + i;
+		lineTag		= line->tag;	
+		isLineValid	= line->isValid;
+
+		if(isLineValid){
+			validLineNum++;
+		}
+
+		if(isLineValid  &&  traceTag == lineTag){ // cache hit!
+			retListTail = retListHead = createLinkedList(HIT);
+					//puts("--HIT!--");
+					//printf("vt %d_%d\n", line->isValid, line->tag);
+			break; 
+		}
+		else{	// cache miss!
+			retListTail = retListHead = createLinkedList(MISS);
+					//puts("--MISS--");
+					//printf("vt %d_%d\n", line->isValid, line->tag);
+			line->tag = traceTag;
+			line->isValid = true;
+					//printf("vt %d_%d\n", line->isValid, line->tag);
+			if(validLineNum == E){
+				retListTail = addNode(retListTail, EVICT);
+			}
+		}
+	}
+
+
+	if(act == 'M'){ // same set, same tag, 100% valid, 100% HIT
+		// cache hit!
+		retListTail = addNode(retListTail, HIT);
+					//puts("--2:HIT!--");
+					//printf("vt %d_%d\n", line->isValid, line->tag);
+	}else if(act != 'L' && act != 'S'){
+		printf("critical error! invalid Trace input: %c", act);
+		exit(EXIT_FAILURE);
+	}
+				printf("sEb:%lu,%lu,%lu | act,idx,lineTag:%c %u %u | ",
+						s,E,b,act,idx,lineTag);
+				printList(retListHead);
+	return retListHead;
+}
+
+
+/*--------------------------*/
+#ifdef RELEASE
+int main(int argc, char* argv[])
+{
+	int			hflag		= -1;
+	int			vflag		= -1; 
+	char*		tFilePath	= NULL;
+	Tuple_sEb	act_sEb		= interpretOptions(argc, argv, 
+												&tFilePath, 
+												&hflag, &vflag);
+
+	printf("\n>> %d, %d, %s", hflag, vflag, tFilePath);
+	printf("\n>> %d, %d, %d", act_sEb.s, act_sEb.E, act_sEb.b);
+
+    printSummary(argc, 0, 0);
+
+    return 0;
+}
+#endif
+/*--------------------------*/
+
+
+/*--------------------------*/
+#ifndef RELEASE
+
+#include <criterion/criterion.h>
+
+
+Test(traceFileToTraceArr, daveTraceRow1){
+	//given
+	FILE*	pTraceFile	= traceFileOpen("traces/dave.trace");
+	Trace*	traceArr	= malloc(5 * sizeof(Trace));
+
+	//when
+	char act; void** addr; int size;
+	int e = fscanf(pTraceFile, " %c %p,%d", 
+				&act, &addr, &size);
+	traceArr[0].act  = act;
+	traceArr[0].addr = (unsigned long)addr;
+	traceArr[0].size = size;
+
+	printf(">>%d \n", e);
+	//then
+	cr_assert_eq(traceArr[0].act, 'L', 
+			"act = %d != %d", traceArr[0].act, 'L');
+	cr_assert_eq(traceArr[0].addr, 0x10, 
+			"addr = %d != 10", traceArr[0].addr);
+	cr_assert_eq(traceArr[0].size, 4 );
+
+	fclose(pTraceFile);
+	free(traceArr);
+}
+
+Test(traceFileToTraceArr, inCaseOfI){
+	//given
+	FILE*	pTraceFile	= traceFileOpen("traces/trans.trace");
+	int		len			= getNumOfValidLines(pTraceFile);
+	Trace	traceArr[len];
+	
+	//when
+	traceFileToTraceArr(pTraceFile, traceArr);
+
+	//then: omit I line!!
+	//cr_assert_eq(traceArr[1].act, 'S');
+	cr_assert_eq(traceArr[1].act, 'S', 
+			"act = %c != %c", traceArr[1].act, 'S');
+	cr_assert_eq(traceArr[1].addr, 0x7ff000398, 
+			"addr = %x != 0x7ff000398", traceArr[1].addr);
+	cr_assert_eq(traceArr[1].size, 8 );
+	//read file upto end!
+	cr_assert_eq(traceArr[len-1].act, 'L', 
+			"act = %c != %c", traceArr[len-1].act, 'L');
+	cr_assert_eq(traceArr[len-1].addr, 0x00600aa0, 
+			"addr = %x != 0x00600aa0", traceArr[len-1].addr);
+	cr_assert_eq(traceArr[len-1].size, 1 );
+
+	fclose(pTraceFile);
+}
+
+Test(traceFileToTraceArr, getNumOfValidLines){
+	//given
+	FILE*	pTraceFile	= traceFileOpen("traces/dave.trace");
+	FILE*	pTraceFile2	= traceFileOpen("traces/dummy.trace");
+
+	//when
+	int		len			= getNumOfValidLines(pTraceFile);
+	int		len2		= getNumOfValidLines(pTraceFile2);
+	
+	//then
+	cr_assert_eq(len, 5);
+	cr_assert_eq(len2,4);
+
+	fclose(pTraceFile);
+	fclose(pTraceFile2);
+}
+
+
+Test(addressToThreePart, getXXXfunctions){
+	//given
+	Trace			trace	= {'X', 0xba987654321UL, 8};
+
+	//when
+	unsigned		offset	= getOffset(trace.addr, 8);
+	unsigned		index	= getSetIndex(trace.addr, 12, 8);
+	unsigned long	tag		= getTag(trace.addr, 12, 8);
+
+	//then
+	cr_assert_eq(offset, 0x21, "offset = 0x%x != 0x21", offset);
+	cr_assert_eq(index, 0x543, "index = 0x%x != 0x543", index);
+	cr_assert_eq(tag, 0xba9876,"tag = 0x%lx != 0xba9876", tag);
+}
+
+
+void expect_interpretation_eq(Tuple_sEb actual_sEb, 
+							int actual_hflag, int actual_vflag,
+							char* actual_trace_file_path,
+							Tuple_sEb expect_sEb,
+							int expect_hflag, int expect_vflag,
+							char* expect_trace_file_path)
+{
+	cr_expect_str_eq(actual_trace_file_path, actual_trace_file_path);
+	cr_expect_eq(actual_hflag, expect_hflag);
+	cr_expect_eq(actual_vflag, expect_vflag);
+
+	cr_expect_eq(actual_sEb.s, expect_sEb.s,
+			"actual_sEb != expect_sEb \n s: %d != %d \n", 
+			actual_sEb.s, expect_sEb.s);
+	cr_expect_eq(actual_sEb.E, expect_sEb.E,
+			"actual_sEb != expect_sEb \n E: %d != %d \n",
+			actual_sEb.E, expect_sEb.E);
+	cr_expect_eq(actual_sEb.b, expect_sEb.b,
+			"actual_sEb != expect_sEb \n b: %d != %d \n",
+			actual_sEb.b, expect_sEb.b);
+}
+
+Test(argvToOptions, interpretOptions){
+	//given
+	char*		expFilePath	= "traces/trans.trace";
+	int			argc		= 9;
+	char*		argv[9]		= {"./csim", 
+								"-s", "2",
+								"-E", "4",
+								"-b", "3",
+								"-t", expFilePath};
+	Tuple_sEb	exp_sEb		= {2, 4, 3};
+
+	//when
+	int			hflag		= -1;
+	int			vflag		= -1; 
+	char*		tFilePath	= NULL;
+	Tuple_sEb	act_sEb		= interpretOptions(argc, argv, 
+												&tFilePath, 
+												&hflag, &vflag);
+
+	//then
+	expect_interpretation_eq(act_sEb, hflag, vflag, tFilePath,
+							exp_sEb, 0, 0, expFilePath);
+}
+
+
+Test(argvToOptions, interpretOptions2){
+	//given
+	char*		expFilePath	= "traces/yi.trace";
+	Tuple_sEb	exp_sEb		= {4, 1, 4};
+
+	int			argc		= 10;
+	char*		argv[10]	= {"./csim-ref", 
+								"-v",
+								"-s", "4",
+								"-E", "1",
+								"-b", "4",
+								"-t", expFilePath};
+
+	//when
+	char*		tFilePath	= NULL;
+	int			hflag		= -1;
+	int			vflag		= -1; 
+	Tuple_sEb	act_sEb		= interpretOptions(argc, argv, 
+												&tFilePath, 
+												&hflag, &vflag);
+
+	//then
+	expect_interpretation_eq(act_sEb, hflag, vflag, tFilePath,
+							exp_sEb, 0, 1, expFilePath);
+}
+
+Test(argvToOptions, returnEmptyTupleIfErrorOccurred_invalidOption){
+	//given
+	char*		expFilePath	= "traces/yi.trace";
+	Tuple_sEb	exp_sEb		= {0, 0, 0};
+
+	int			argc		= 11;
+	char*		argv[11]	= {"./csim-ref", 
+								"-v",
+								"-error",	//invalid option	
+								"-s", "4",
+								"-E", "1",
+								"-b", "4",
+								"-t", expFilePath};
+
+	//when
+	char*		tFilePath	= NULL;
+	int			hflag		= -1;
+	int			vflag		= -1; 
+	Tuple_sEb	act_sEb		= interpretOptions(argc, argv, 
+												&tFilePath, 
+												&hflag, &vflag);
+
+	//then
+	cr_expect_eq(act_sEb.s, exp_sEb.s,
+			"act_sEb != exp_sEb \n s: %d != %d \n", 
+			act_sEb.s, exp_sEb.s);
+	cr_expect_eq(act_sEb.E, exp_sEb.E,
+			"act_sEb != exp_sEb \n E: %d != %d \n",
+			act_sEb.E, exp_sEb.E);
+	cr_expect_eq(act_sEb.b, exp_sEb.b,
+			"act_sEb != exp_sEb \n b: %d != %d \n",
+			act_sEb.b, exp_sEb.b);
+}
+
+
+Test(linkedList, createNodeAndLink){
+	//given
+	Node	node3 = { {EVICT}, NULL };
+	Node	node2 = { {HIT}, &node3 };
+	Node	head = { {MISS}, &node2 };
+	
+	//then
+	cr_assert_eq(head.act, MISS);
+	cr_assert_eq(head.next->act, HIT);
+	cr_assert_eq(head.next->next->act, EVICT);
+}
+
+Test(linkedList, createLinkedListAndAddNodesAndFree){
+	//given
+	Node*	head		= NULL;
+	SIM_ACT	firstVal	= MISS;
+
+	//when
+	head = createLinkedList(firstVal);	
+	if(head == NULL){
+		printf("heap allocation error occurred! \n");
+		exit(EXIT_FAILURE);
+	}
+	Node*	tail = addNode(head, HIT);	// add HIT node
+
+	tail = addNode(tail, EVICT);	// add EVICT node to tail and update tail
+	//then
+	cr_assert_eq(head->act, MISS);
+	cr_assert_eq(head->next->act, HIT);
+	cr_assert_eq(head->next->next->act, EVICT);
+
+	//free 
+	freeList(&head);
+	cr_assert_eq(head, NULL);
+}
+
+Test(linkedList, printList){
+	Node*	head		= NULL;
+	SIM_ACT	firstVal	= MISS;
+	//printList(head); // "empty list"
+
+	head = createLinkedList(firstVal);	
+	if(head == NULL){
+		printf("heap allocation error occurred! \n");
+		exit(EXIT_FAILURE);
+	}
+	Node*	tail = addNode(head, HIT);	// add HIT node
+	tail = addNode(tail, EVICT);	// add EVICT node to tail
+	//printList(head); // "HIT HIT EVICT"
+
+	freeList(&head);
+}
+
+Test(linkedList, getLength_Empty){
+	//given
+	Node*	list = NULL;
+	//when
+	int len = getLength(list);
+	//then
+	cr_assert_eq(len, 0);
+}
+
+Test(linkedList, getLength_notEmpty){
+	//given
+	Node*	list = createLinkedList(MISS);
+	//when
+	int len = getLength(list);
+	//then
+	cr_assert_eq(len, 1);
+}
+
+Test(linkedList, getTail){
+	//given
+	Node*	list		= createLinkedList(MISS);
+	Node*	tail		= addNode(list, HIT);
+	tail = addNode(tail, EVICT);
+	tail = addNode(tail, HIT);
+	//when
+	Node*	gottenTail	= getTail(list);
+	SIM_ACT	actOfTail	= gottenTail->act;
+	//then
+	cr_assert_eq(actOfTail, tail->act);
+	cr_assert_eq(gottenTail, tail);
+}
+
+Test(linkedList, ifListDidntAllocatedThen_getTail_returnNULL){
+	//given
+	Node*	head	= NULL;
+	//when
+	Node*	tail	= getTail(head);
+	//then
+	cr_assert_null(tail);
+}
+
+Test(queue, successful_enqueue_inCaseOfEmptyQueue){
+	//given
+	Node*	queue	= NULL;
+	Line*	line	= NULL;
+	int		len		= 0;
+
+	//when
+	Node*	endOfQ	= enqueue(&queue, line);
+	len = getLength(queue);
+				//DBG: printf(">>? %p \n", queue);
+	//then
+	cr_expect_eq(len, 1, "len = %d", len);
+	cr_assert_eq( peek(queue), line );
+	cr_assert_eq( endOfQ->ptr, line );
+}
+
+Test(queue, successful_enqueue_notEmptyQueue){
+	//given
+	Line*	line1	= (Line*)1;
+	Line*	line2	= (Line*)2;
+	Node*	queue	= NULL;
+	Node*	endOfQ	= NULL;
+	int		len		= 0;
+
+	//when
+	endOfQ	= enqueue(&queue, line1);
+	endOfQ	= enqueue(&queue, line2);
+	len = getLength(queue);
+
+	//then
+	cr_expect_eq(len, 2, "len = %d", len);
+	cr_assert_eq( endOfQ->ptr, line2 );
+}
+
+Test(queue, dequeue){
+	//given
+	int		len			= 0;
+	Node*	extracted	= NULL;
+
+	Node*	queue		= NULL;
+	Line*	line1		= (Line*)1;
+	Line*	line2		= (Line*)2;
+
+	enqueue(&queue, line1);
+	enqueue(&queue, line2);
+	int before = len = getLength(queue);
+	
+	//when
+	extracted = dequeue(&queue);
+	len = getLength(queue);
+
+	//then
+	cr_assert_eq(extracted->ptr, line1);
+	cr_assert_eq(queue->ptr, line2);
+	cr_assert_eq(len, before-1, "len = %d != %d", len, before-1);
+
+	free(extracted); // it's annoying!
+}
+
+Test(queue, ifOneNodeInQueueThen_dequeue_makeQueuePtrNULL){
+	//given
+	Node*	extracted	= NULL;
+	Node*	queue		= NULL;
+	Line*	line1		= (Line*)1;
+
+	enqueue(&queue, line1);
+	cr_assert_eq(queue->ptr, line1);
+
+	//when
+	extracted = dequeue(&queue);
+
+	//then
+	cr_assert_eq(extracted->ptr, line1);
+	cr_assert_eq(queue, NULL);
+	cr_assert_eq(getLength(queue), 0);
+
+	free(extracted); // it's annoying!
+}
+
+Test(queue, dequeueAndFree){
+	//given
+	int		len			= 0;
+	Line*	extracted	= NULL;
+
+	Node*	queue		= NULL;
+	Line*	line1		= (Line*)1;
+	Line*	line2		= (Line*)2;
+
+	enqueue(&queue, line1);
+	enqueue(&queue, line2);
+	int before = len = getLength(queue);
+	
+	//when
+	extracted = dequeueAndFree(&queue);
+	len = getLength(queue);
+
+	//then
+	cr_assert_eq(extracted, line1);
+	cr_assert_eq(queue->ptr, line2);
+	cr_assert_eq(len, before-1, "len = %d != %d", len, before-1);
+}
+
+Test(queue, dequeueAndFree_makeQueueNULL){
+	//given
+	Line*	extracted	= NULL;
+
+	Node*	queue		= NULL;
+	Line*	line1		= (Line*)1;
+
+	enqueue(&queue, line1);
+	cr_assert_eq(queue->ptr, line1);
+	
+	//when
+	extracted = dequeueAndFree(&queue);
+
+	//then
+	cr_assert_eq(extracted, line1);
+	cr_assert_eq(queue, NULL);
+}
+
+
+Test(cacheSimulator, createCache){
+	//given
+	Tuple_sEb	sEb		= { 3, 4, 5 };
+	int			S		= (1 << sEb.s);
+
+	//when
+	Cache*		cache	= createCache(sEb);
+
+	//then
+	cr_assert_eq(cache->S, S);
+	cr_assert_eq(cache->E, sEb.E);
+
+	for(int i = 0; i < S; i++){
+		// assert Set(s) allocation
+		cr_assert_null(cache->setArr[i].queue);
+		// assert Line(s) allocation
+		for(int j = 0; j < sEb.E; j++){
+			cr_assert_eq( cache->setArr[i].lineArr[j].isValid, false );
+			cr_assert_eq( cache->setArr[i].lineArr[j].tag, 0U);
+		}
+	}
+	
+	//TODO: FREE CACHE!!!
+}
+
+Test(cacheSimulator, optionsToResultString){
+	cr_skip_test("create Cache first!");
+	//given
+	char* resultStr = "nope";
+	
+	//when
+	
+	//then
+	cr_expect_str_eq(resultStr,"L 10,4 miss\nS 18,4 hit\nL 20,4 miss\nS 28,4 hit\nS 50,4 miss\n");
+}
+
+
+// vtq means: valid? / tag mathced? / full queue? / act
+Test(cacheSimulator, whenColdCacheLineLoad_vtq_000L){
+	//given
+	//-v -s 2 -E 1 -b 2 -t traces/dave.trace
+	Tuple_sEb	sEb			= { 2, 1, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		trace		= { 'L', 0, 1 };
+	Node*		resLists[1]; 
+	//when
+	resLists[0] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->act, MISS);
+	//cr_expect_eq(resLists[1]->act, HIT);
+
+	//TODO: FREE CACHE!!!
+	//TODO: FREE resLists!
+}
+
+Test(cacheSimulator, whenFullSetAndWarmedLineLoad_vtq_111L){
+	//given
+	//-v -s 2 -E 1 -b 2 -t traces/
+	Tuple_sEb	sEb			= { 2, 1, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		warmup		= { 'L', 0x10, 1 };
+	Trace		trace		= { 'L', 0x12, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, warmup, sEb);
+	resLists[1] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[1]->act, HIT, 
+			"HIT = 0 != %d", resLists[1]->act);
+
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheSimulator, whenColdCacheLineModify_vtq_000M){
+	//given
+	Tuple_sEb	sEb			= { 2, 1, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		trace		= { 'M', 0x20, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->act, MISS, 
+			"MISS = 1 != %d", resLists[0]->act);
+	cr_expect_eq(resLists[0]->next->act, HIT, 
+			"HIT = 0 != %d", resLists[0]->next->act);
+
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheSimulator, whenQueueIsNotEmptyAndTagNotMatching_vtq_100L){
+	//given
+	Tuple_sEb	sEb			= { 2, 3, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		warmup		= { 'L', 0x10, 1 };
+	Trace		trace		= { 'L', 0x20, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, warmup, sEb);
+	resLists[1] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->act, MISS, 
+			"MISS = 1 != %d", resLists[0]->act);
+	cr_expect_eq(resLists[1]->act, MISS, 
+			"MISS = 1 != %d", resLists[1]->act);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheSimulator, whenQueueIsNotEmptyAndTagNotMatching_vtq_100M){
+	//given
+	Tuple_sEb	sEb			= { 2, 3, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		warmup		= { 'L', 0x10, 1 };
+	Trace		trace		= { 'M', 0x20, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, warmup, sEb);
+	resLists[1] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->act, MISS, 
+			"MISS = 1 != %d", resLists[0]->act);
+	cr_expect_eq(resLists[1]->act, MISS, 
+			"MISS = 1 != %d", resLists[1]->act);
+	cr_expect_eq(resLists[1]->next->act, HIT, 
+			"HIT = 0 != %d", resLists[1]->next->act);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheSimulator, whenQueueIsNotEmptyAndTagMatched_vtq_110L){
+	//given
+	Tuple_sEb	sEb			= { 2, 3, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		warmup		= { 'L', 0x10, 1 };
+	Trace		trace		= { 'L', 0x10, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, warmup, sEb);
+	resLists[1] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->act, MISS, 
+			"MISS = 1 != %d", resLists[0]->act);
+	cr_expect_eq(resLists[1]->act, HIT, 
+			"HIt = 0 != %d", resLists[1]->act);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheSimulator, whenQueueIsNotEmptyAndTagMatched_vtq_110M){
+	//given
+	Tuple_sEb	sEb			= { 2, 3, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		warmup		= { 'L', 0x10, 1 };
+	Trace		trace		= { 'M', 0x12, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, warmup, sEb);
+	resLists[1] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->act, MISS, 
+			"MISS = 1 != %d", resLists[0]->act);
+	cr_expect_eq(resLists[1]->act, HIT, 
+			"HIT = 0 != %d", resLists[1]->act);
+	cr_expect_eq(resLists[1]->next->act, HIT, 
+			"HIT = 0 != %d", resLists[1]->next->act);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheSimulator, whenQueueIsFullAndTagNotMatched_vtq_101L__EVICT){
+	//given
+	Tuple_sEb	sEb			= { 2, 1, 2 };
+	Cache*		cache		= createCache(sEb);
+	Trace		warmup		= { 'L', 0x10, 1 };
+	Trace		trace		= { 'L', 0x20, 1 };
+	Node*		resLists[2]; 
+	//when
+	resLists[0] = runCache(cache, warmup, sEb);
+	resLists[1] = runCache(cache, trace, sEb);
+	//then
+	cr_expect_eq(resLists[0]->acfffdjijdfkjsfdkjlsdflkjasdf, MISS, 
+			"MISS = 1 !dwwsskkkkkkk %d", resLists[0]->act);
+	cr_expect_eq(resLists[1]->act, MISS, 
+			"MISS = 1 != %d", resLists[1]->act);
+	cr_expect_eq(resLists[1]->next->act, EVICT, 
+			"EVICT= 2 != %d", resLists[1]->next->act);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+void assertSummary(SIM_ACT summary[ACT_NUM], 
+				int hit, int miss, int evict)
+{
+	cr_assert_eq(summary[HIT], hit);
+	cr_assert_eq(summary[MISS], miss);
+	cr_assert_eq(summary[EVICT], evict);
+}
+
+Test(cacheAndTraceIntergration, dave_sEb_414_noEvictionCase){
+	//given
+	// -v -s 4 -E 1 -b 4 -t traces/dave.trace
+	FILE*		pTraceFile		= traceFileOpen("traces/dave.trace");
+	int			len				= getNumOfValidLines(pTraceFile);
+	Trace		traceArr[len];
+
+	Tuple_sEb	sEb				= { 4, 1, 4 };
+	Cache*		cache			= createCache(sEb);
+	Node*		resLists[len]; 
+	SIM_ACT		summary[ACT_NUM];
+
+	traceFileToTraceArr(pTraceFile, traceArr);
+
+	//when
+	for(int i = 0; i < len; i++){
+		resLists[i] = runCache(cache, traceArr[i], sEb);
+	}
+	getSummary(summary, resLists, len);
+
+	//then
+	puts("---- show time! ----");
+	for(int i = 0; i < len; i++){
+		printList(resLists[i]);
+	}
+	puts("----    end    ----");
+
+	assertSummary(summary, 2,3,0); 
+	
+	fclose(pTraceFile);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+Test(cacheAndTraceIntergration, yi2_sEb_411_noEvictionCase){
+	//given
+	// -v -s 4 -E 1 -b 1 -t traces/yi2.trace
+	FILE*		pTraceFile		= traceFileOpen("traces/yi2.trace");
+	int			len				= getNumOfValidLines(pTraceFile);
+	Trace		traceArr[len];
+
+	Tuple_sEb	sEb				= { 4, 1, 1 };
+	Cache*		cache			= createCache(sEb);
+	Node*		resLists[len]; 
+	SIM_ACT		summary[ACT_NUM];
+
+	traceFileToTraceArr(pTraceFile, traceArr);
+
+	//when
+	for(int i = 0; i < len; i++){
+		resLists[i] = runCache(cache, traceArr[i], sEb);
+	}
+	getSummary(summary, resLists, len);
+
+	//then
+	puts("---- show time! ----");
+	for(int i = 0; i < len; i++){
+		printList(resLists[i]);
+	}
+	puts("----    end    ----");
+
+	assertSummary(summary, 9, 8, 0);
+
+	fclose(pTraceFile);
+	//TODO: FREE CACHE!!!
+	//TODO: FREE ENTRIES of resLists!
+}
+
+
+#endif
+/*--------------------------*/
